@@ -75,6 +75,11 @@ module Impair
 
     def serve(client)
       upstream = TCPSocket.new(@target_host, @target_port)
+      # Without this, Nagle holds a sub-MSS write until the previous segment is
+      # acknowledged. The relay writes at most one MSS at a time, so every
+      # write is a candidate, and the result is tens of milliseconds of delay
+      # attributed to the protocol under test rather than to the relay.
+      [client, upstream].each { |s| s.setsockopt(:IPPROTO_TCP, :TCP_NODELAY, 1) rescue nil }
       pumps = [
         Thread.new { pump(client, upstream) },
         Thread.new { pump(upstream, client) }

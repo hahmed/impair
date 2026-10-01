@@ -27,6 +27,8 @@ require_relative "impair/version"
 # Counts every decision, so an experiment can assert the impairment happened
 # rather than trusting that it did.
 module Impair
+  Error = Class.new(StandardError)
+
   # loss and reorder are 1-in-N, the way MsQuic's emulated-performance runs
   # express them. Zero disables. Delays are seconds.
   #
@@ -50,9 +52,13 @@ module Impair
     end
   end
 
+  # overrun is the relay dropping on its own floor rather than the link's: the
+  # processing queue was full, so a received packet was discarded before any
+  # impairment decision was made. Distinct from dropped, which is the link.
   Counts = Struct.new(:forwarded, :dropped, :reordered, :corrupted, :oversized, :throttled,
-    keyword_init: true) do
-    def initialize(forwarded: 0, dropped: 0, reordered: 0, corrupted: 0, oversized: 0, throttled: 0)
+    :overrun, keyword_init: true) do
+    def initialize(forwarded: 0, dropped: 0, reordered: 0, corrupted: 0, oversized: 0,
+      throttled: 0, overrun: 0)
       super
     end
 
@@ -68,6 +74,7 @@ module Impair
       parts << "corrupted=#{corrupted}" if corrupted.positive?
       parts << "oversized=#{oversized}" if oversized.positive?
       parts << "throttled=#{throttled}" if throttled.positive?
+      parts << "overrun=#{overrun}" if overrun.positive?
       parts.join(" ")
     end
   end
