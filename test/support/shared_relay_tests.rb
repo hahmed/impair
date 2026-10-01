@@ -48,7 +48,6 @@ module SharedRelayTests
   end
 
   def test_update_changes_impairment_mid_run
-    skip "TODO: Relay#update"
     relay = build_relay(loss: 2)
     exchange(relay, 100)
     before = relay.counts.dropped
@@ -63,7 +62,6 @@ module SharedRelayTests
   end
 
   def test_update_returns_self_for_chaining
-    skip "TODO: Relay#update"
     relay = build_relay
     assert_same relay, relay.update(delay: 0.01)
   ensure
@@ -73,7 +71,6 @@ module SharedRelayTests
   # The recovery experiment: cut the link, restore it, watch the protocol
   # climb back. Everything in the hole is lost; everything after gets through.
   def test_blackhole_swallows_everything_then_heals
-    skip "TODO: Relay#blackhole"
     relay = build_relay
     relay.blackhole(0.3)
 
@@ -89,7 +86,6 @@ module SharedRelayTests
   end
 
   def test_blackhole_is_not_counted_as_link_loss
-    skip "TODO: Relay#blackhole"
     relay = build_relay(loss: 0)
     relay.blackhole(0.2)
     exchange(relay, 10, wait: 0.05)
@@ -101,7 +97,6 @@ module SharedRelayTests
   end
 
   def test_counts_are_split_by_direction
-    skip "TODO: Counts#client / Counts#server"
     relay = build_relay
     exchange(relay, 10)
 
@@ -113,7 +108,6 @@ module SharedRelayTests
   end
 
   def test_shortfall_is_direction_aware
-    skip "TODO: shortfall(client:, server:)"
     relay = build_relay
     exchange(relay, 10)
     relay.stop
@@ -124,7 +118,6 @@ module SharedRelayTests
   end
 
   def test_verify_passes_on_a_quiet_link
-    skip "TODO: verify!(client:, server:)"
     relay = build_relay
     exchange(relay, 10)
     relay.stop

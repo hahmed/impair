@@ -19,40 +19,34 @@ module Impair
   # packet causes all active transactions to experience a stall regardless of
   # whether that transaction was directly impacted by the lost packet."
   #
-  # So loss here is a stall of the whole stream for one round trip, decided per
-  # segment-sized chunk. That is the same currency as the UDP side, where a
-  # dropped datagram costs its stream one round trip, which makes the two
-  # comparable: same loss probability per packet, same cost per loss, and the
-  # difference left over is the protocol's.
+  # So loss here is a stall of the whole stream for one round trip (2 * delay),
+  # decided per segment-sized chunk. That is the same currency as the UDP side,
+  # where a dropped datagram costs its stream one round trip, which makes the
+  # two comparable: same loss probability per packet, same cost per loss, and
+  # the difference left over is the protocol's. It follows that loss on a
+  # zero-delay link costs nothing here, which is also true of the real thing.
   #
   # What it does not reproduce: congestion window collapse, spurious
   # retransmits, SACK behaviour, or the sender learning anything. It emulates
-  # the head-of-line stall, not TCP's full reaction to loss.
+  # the head-of-line stall, not TCP's full reaction to loss. corrupt, reorder,
+  # max_size and rate are accepted for Config parity and ignored.
   class Tcp
-    attr_reader :port, :counts
+    include Relay
 
-    # loss is 1-in-N segments, each costing the whole stream one rtt. mss sets
-    # what counts as a segment, so the probability is per packet rather than
-    # per read, which would depend on the relay's buffer size instead of the
-    # network.
-    def initialize(target_host:, target_port:, host: "127.0.0.1", port: 0,
-      loss: 0, rtt: 0.05, mss: 1460, delay: 0, seed: 1234)
+    def initialize(target_host:, target_port:, host: "127.0.0.1", port: 0, **options)
       @target_host = target_host
       @target_port = target_port
-      @loss = loss
-      @rtt = rtt
-      @mss = mss
-      @delay = delay
-      @random = Random.new(seed)
-      @counts = Counts.new
+      @link = Link.new(Config.new(**options))
       @server = TCPServer.new(host, port)
       @port = @server.addr[1]
+      @connections = []
+      @connections_mutex = Mutex.new
       @running = false
-      @mutex = Mutex.new
     end
 
     def start
       @running = true
+      @link.start
       @acceptor = Thread.new do
         while @running
           # Pass the socket as an argument. A while-loop local is one variable
@@ -69,13 +63,35 @@ module Impair
     end
 
     def stop
+      return counts unless @running
+
       @running = false
       @server.close unless @server.closed?
       @acceptor&.join(1)
-      @counts
+      @link.stop
+      each_connection { |c, u| [c, u].each { |s| s.close rescue nil } }
+      counts
+    end
+
+    # Send RST on every live connection, the way a middlebox or a crashed peer
+    # does. SO_LINGER with a zero timeout makes close() reset instead of FIN.
+    # New connections are accepted as before.
+    def reset
+      each_connection do |client, upstream|
+        [client, upstream].each do |s|
+          s.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, [1, 0].pack("ii")) rescue nil
+          s.close rescue nil
+        end
+        counts.reset += 1
+      end
+      self
     end
 
     private
+
+    def each_connection(&)
+      @connections_mutex.synchronize { @connections.dup }.each(&)
+    end
 
     def serve(client)
       upstream = TCPSocket.new(@target_host, @target_port)
@@ -84,41 +100,80 @@ module Impair
       # write is a candidate, and the result is tens of milliseconds of delay
       # attributed to the protocol under test rather than to the relay.
       [client, upstream].each { |s| s.setsockopt(:IPPROTO_TCP, :TCP_NODELAY, 1) rescue nil }
+      @connections_mutex.synchronize do
+        @connections << [client, upstream]
+        counts.connections += 1
+      end
       pumps = [
-        Thread.new { pump(client, upstream) },
-        Thread.new { pump(upstream, client) }
+        Thread.new { pump(:client, client, upstream) },
+        Thread.new { pump(:server, upstream, client) }
       ]
       pumps.each(&:join)
     rescue StandardError
       nil
     ensure
+      @connections_mutex.synchronize { @connections.delete([client, upstream]) }
       client.close rescue nil
       upstream&.close rescue nil
     end
 
-    # Read at most one segment at a time so that the loss decision is made per
-    # segment. A single 64 KiB read would be 45 segments on the wire and one
-    # roll of the dice.
-    def pump(from, to)
-      while (chunk = from.readpartial(@mss))
-        @mutex.synchronize { @counts.forwarded += 1 }
+    # Read one segment at a time so the loss decision is per segment: a single
+    # 64 KiB read would be 45 segments on the wire and one roll of the dice.
+    #
+    # Reading never sleeps. Each segment gets a deadline and a writer thread
+    # delivers it then, in order. Sleeping here instead charged the delay once
+    # per segment rather than once per link: 100 KB at 25ms took 1.75s.
+    def pump(direction, from, to)
+      outbox = Queue.new
+      writer = Thread.new { write_deferred(outbox, to) }
+      last_deadline = 0.0
 
-        if lost?
-          @mutex.synchronize { @counts.dropped += 1 }
-          # The gap stalls everything behind it, which is the whole point.
-          sleep(@rtt)
+      while (chunk = from.readpartial(config.mss))
+        deadline = [@link.now + @link.latency(direction), last_deadline].max
+
+        if @link.blackholed?
+          # Nothing crosses until the hole heals, then everything behind it
+          # arrives at once, which is what a retransmit after an outage does.
+          @link.bump(direction, :blackholed)
+          deadline = [deadline, @link.blackhole_until].max
         end
 
-        sleep(@delay) if @delay.positive?
-        to.write(chunk)
+        if @link.lost?(direction)
+          # The gap stalls everything behind it, which is the whole point.
+          @link.bump(direction, :dropped)
+          deadline += config.rtt
+        end
+
+        queued = @link.shape(direction, chunk.bytesize)
+        if queued
+          deadline += queued
+        else
+          # Shaper queue overflowed. TCP would retransmit; charge an RTT.
+          deadline += config.rtt
+        end
+
+        @link.bump(direction, :forwarded)
+        last_deadline = deadline
+        outbox << [deadline, chunk]
       end
     rescue EOFError, IOError, Errno::ECONNRESET, Errno::EPIPE, Errno::EBADF
       nil
     ensure
-      to.close_write rescue nil
+      outbox.close
+      writer.join
     end
 
-    def lost? = @loss.positive? && @mutex.synchronize { @random.rand(@loss).zero? }
+    def write_deferred(outbox, to)
+      while (item = outbox.pop)
+        deadline, chunk = item
+        wait = deadline - @link.now
+        sleep(wait) if wait.positive?
+        to.write(chunk)
+      end
+    rescue IOError, Errno::ECONNRESET, Errno::EPIPE, Errno::EBADF
+      nil
+    ensure
+      to.close_write rescue nil
+    end
   end
-
 end

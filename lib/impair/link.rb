@@ -1,0 +1,368 @@
+# frozen_string_literal: true
+
+module Impair
+  # The impairment engine both relays share: one Config, one set of counters,
+  # one RNG per direction, and every decision about what happens to a packet.
+  # Udp and Tcp are transports over this; the only thing they decide for
+  # themselves is what "dropping" means on their wire.
+  class Link
+    Direction = %i[client server].freeze
+
+    attr_reader :config, :counts
+
+    def initialize(config)
+      @config = config
+      @counts = Counts.new
+      @mutex = Mutex.new
+      # One RNG per direction. A single shared RNG drawn from both pumps makes
+      # the sequence each direction sees depend on scheduler interleaving:
+      # the loss *rate* is unaffected -- every draw is still 1-in-N -- but
+      # the run is unrepeatable.
+      @random = { client: Random.new(config.seed), server: Random.new(config.seed ^ 0xffff) }
+      @burst_state = { client: :good, server: :good }
+      @burst_run = { client: 0, server: 0 }
+      @free_at = { client: 0.0, server: 0.0 }
+      @bucket = 0
+      @refilled_at = now
+      @blackhole_until = 0.0
+      @timers = Heap.new
+      @timer_mutex = Mutex.new
+      @timer_wake = ConditionVariable.new
+      @running = false
+    end
+
+    # Swap the whole Config atomically. Readers see old or new, never a mix.
+    def update(**changes)
+      @config = @config.with(**changes)
+      self
+    end
+
+    # Swallow everything for +seconds+. Counted as blackholed, not as link
+    # loss, so loss_rate still describes the configured impairment.
+    def blackhole(seconds)
+      @blackhole_until = now + seconds
+      self
+    end
+
+    def blackholed? = now < @blackhole_until
+
+    attr_reader :blackhole_until
+
+    def rng(direction) = @random[direction]
+
+    def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    def bump(direction, field)
+      @mutex.synchronize { @counts[direction][field] += 1 }
+    end
+
+    # Decide whether the link carries this packet. Returns the data to send
+    # (possibly corrupted) or nil if it was discarded, in which case it has
+    # already been tallied. The caller tallies forwarded once it actually
+    # sends. Order matters: a packet the link never carried cannot also be
+    # corrupted.
+    def admit(direction, data, corruptible: true)
+      if blackholed?
+        bump(direction, :blackholed)
+        return nil
+      end
+      if lost?(direction)
+        bump(direction, :dropped)
+        return nil
+      end
+      if too_large?(direction, data)
+        bump(direction, :oversized)
+        return nil
+      end
+      if throttled?(direction)
+        bump(direction, :throttled)
+        return nil
+      end
+
+      corruptible && roll?(direction, @config.corrupt) ? corrupt(direction, data) : data
+    end
+
+    # How long this packet waits before it may leave, beyond base delay: the
+    # time it spends behind earlier bytes on a bandwidth-limited link. nil if
+    # the queue is full and the packet is discarded (tallied as overflow).
+    #
+    # A virtual queue: no bytes are held, only the time at which the link is
+    # next free. Over-budget packets are scheduled later rather than dropped,
+    # which is what produces queueing delay, and what a policer cannot.
+    def shape(direction, bytes)
+      return 0.0 unless @config.bandwidth.positive?
+
+      @mutex.synchronize do
+        t = now
+        start = [t, @free_at[direction]].max
+        queued_bytes = (start - t) * @config.bandwidth
+        if queued_bytes + bytes > @config.queue
+          @counts[direction].overflow += 1
+          return nil
+        end
+        @free_at[direction] = start + bytes.fdiv(@config.bandwidth)
+        @free_at[direction] - t
+      end
+    end
+
+    # One-way latency for this packet: delay plus a jitter sample. Uniform
+    # in [-jitter, +jitter], clamped at zero.
+    def latency(direction)
+      base = @config.delay
+      return base unless @config.jitter.positive?
+
+      [base + (rng(direction).rand * 2 - 1) * @config.jitter, 0.0].max
+    end
+
+    def reorder?(direction) = roll?(direction, @config.reorder)
+
+    # --- timers -------------------------------------------------------------
+
+    def start
+      @running = true
+      @timer_thread = Thread.new { run_timers }
+      self
+    end
+
+    def stop
+      @running = false
+      @timer_mutex.synchronize { @timer_wake.broadcast }
+      @timer_thread&.join(1)
+      self
+    end
+
+    def pending? = @timer_mutex.synchronize { !@timers.empty? }
+
+    def at(deadline, &block)
+      @timer_mutex.synchronize do
+        @timers.push(deadline, block)
+        @timer_wake.signal
+      end
+    end
+
+    def after(seconds, &block) = at(now + seconds, &block)
+
+    # Bernoulli when burst is off. Gilbert-Elliott when on: a good state that
+    # never drops and a bad state that always does, with transition
+    # probabilities chosen so the stationary loss rate is still 1/loss and the
+    # mean bad-run length is +burst+. Burst loss is where HTTP/3 and HTTP/1
+    # separate -- one burst stalls every stream on a TCP connection and only
+    # the hit streams on QUIC -- so independent loss understates the gap.
+    def lost?(direction)
+      return false unless @config.loss.positive?
+      return roll?(direction, @config.loss) if @config.burst <= 1
+
+      r = 1.0 / @config.loss
+      p_bad_to_good = 1.0 / @config.burst
+      p_good_to_bad = p_bad_to_good * r / (1 - r)
+      rnd = rng(direction).rand
+
+      @mutex.synchronize do
+        state = @burst_state[direction]
+        @burst_state[direction] = if state == :good
+          rnd < p_good_to_bad ? :bad : :good
+        else
+          rnd < p_bad_to_good ? :good : :bad
+        end
+        if @burst_state[direction] == :bad
+          @burst_run[direction] += 1
+          t = @counts[direction]
+          t.longest_burst = @burst_run[direction] if @burst_run[direction] > t.longest_burst
+          true
+        else
+          @burst_run[direction] = 0
+          false
+        end
+      end
+    end
+
+    private
+
+    def roll?(direction, denominator) = denominator.positive? && rng(direction).rand(denominator).zero?
+
+    def too_large?(_direction, data)
+      @config.max_size.positive? && data.bytesize > @config.max_size
+    end
+
+    # A token bucket refilled every rate_interval, as smoltcp does it: packets
+    # per interval. A policer -- over-budget packets are discarded, so this
+    # produces loss, not queueing. See #shape for the shaper.
+    def throttled?(_direction)
+      return false unless @config.rate.positive?
+
+      @mutex.synchronize do
+        t = now
+        if t - @refilled_at > @config.rate_interval
+          @bucket = @config.rate
+          @refilled_at = t
+        end
+        if @bucket.positive?
+          @bucket -= 1
+          false
+        else
+          true
+        end
+      end
+    end
+
+    # A single bit flip, which smoltcp picks as the most likely corruption and
+    # the hardest to detect. QUIC authenticates every packet, so the peer
+    # discards it: corruption and loss look alike on the wire and differ in
+    # whether the sender learns anything.
+    def corrupt(direction, data)
+      r = rng(direction)
+      flipped = data.dup
+      index = r.rand(flipped.bytesize)
+      flipped.setbyte(index, flipped.getbyte(index) ^ (1 << r.rand(8)))
+      bump(direction, :corrupted)
+      flipped
+    end
+
+    def run_timers
+      loop do
+        block = @timer_mutex.synchronize do
+          return unless @running
+
+          if @timers.empty?
+            @timer_wake.wait(@timer_mutex, 0.05)
+            next
+          end
+          wait = @timers.peek_deadline - now
+          if wait.positive?
+            @timer_wake.wait(@timer_mutex, wait)
+            next
+          end
+          @timers.pop
+        end
+        next unless block
+
+        begin
+          block.call
+        rescue IOError, Errno::EBADF, Errno::EPIPE, Errno::ECONNRESET
+          nil
+        end
+      end
+    end
+
+    # Binary min-heap on deadline. Sorting the whole array on every insert was
+    # O(n log n) per packet under the lock, and it added load-dependent jitter
+    # that looked like protocol behaviour.
+    class Heap
+      def initialize
+        @a = []
+        @seq = 0
+      end
+
+      def empty? = @a.empty?
+
+      def peek_deadline = @a.first[0]
+
+      def push(deadline, block)
+        @a << [deadline, @seq += 1, block]
+        up(@a.size - 1)
+      end
+
+      def pop
+        top = @a.first
+        last = @a.pop
+        unless @a.empty?
+          @a[0] = last
+          down(0)
+        end
+        top[2]
+      end
+
+      private
+
+      def less(i, j) = (@a[i][0] <=> @a[j][0]).nonzero? || (@a[i][1] <=> @a[j][1])
+
+      def up(i)
+        while i.positive?
+          parent = (i - 1) / 2
+          break if less(parent, i) <= 0
+
+          @a[parent], @a[i] = @a[i], @a[parent]
+          i = parent
+        end
+      end
+
+      def down(i)
+        n = @a.size
+        loop do
+          l = 2 * i + 1
+          r = l + 1
+          m = i
+          m = l if l < n && less(l, m).negative?
+          m = r if r < n && less(r, m).negative?
+          break if m == i
+
+          @a[m], @a[i] = @a[i], @a[m]
+          i = m
+        end
+      end
+    end
+  end
+
+  # What Udp and Tcp share above the Link: lifecycle, counts, runtime control,
+  # and self-verification.
+  module Relay
+    attr_reader :port
+
+    def config = @link.config
+    def counts = @link.counts
+
+    def update(**changes)
+      @link.update(**changes)
+      self
+    end
+
+    def blackhole(seconds)
+      @link.blackhole(seconds)
+      self
+    end
+
+    # What the relay never got to make a decision about.
+    #
+    # The kernel drops datagrams that arrive while the receive buffer is full,
+    # before the relay sees them. Those are invisible to every counter here:
+    # they thin forwarded and dropped together, so loss_rate stays flat at the
+    # advertised figure while the actual link loses far more. A relay that
+    # cannot keep up reports a healthy 2% on a link losing 26%.
+    #
+    # So a caller that knows how many packets it offered must check. Pass a
+    # total, or per direction. Counting every decision is only a guarantee for
+    # decisions the relay was handed.
+    def shortfall(total = nil, client: nil, server: nil)
+      raise ArgumentError, "pass a total or client:/server:" if total.nil? && client.nil? && server.nil?
+
+      tally = if total
+        counts.combined
+      else
+        [client && counts.client, server && counts.server].compact.reduce(:+)
+      end
+      offered = total || (client.to_i + server.to_i)
+      seen = tally.total + tally.overrun
+      unreceived = offered - seen
+      missing = unreceived + tally.overrun
+      { offered: offered, observed: tally.total, overrun: tally.overrun,
+        unreceived: unreceived, missing: missing,
+        rate: offered.zero? ? 0.0 : missing.fdiv(offered) }
+    end
+
+    # Raises unless the relay saw essentially everything that was sent. Use
+    # this to gate a published throughput number.
+    def verify!(total = nil, tolerance: 0.01, **directions)
+      result = shortfall(total, **directions)
+      return result if result[:rate] <= tolerance
+
+      raise Error, format(
+        "relay lost %d of %d packets before impairing them (%.1f%%): %d never received " \
+        "(kernel buffer), %d overran the processing queue. Measured link loss is not the " \
+        "configured loss.%s Lower the offered rate.",
+        result[:missing], result[:offered], result[:rate] * 100,
+        result[:unreceived], result[:overrun],
+        respond_to?(:rcvbuf) ? " rcvbuf=#{rcvbuf}." : ""
+      )
+    end
+  end
+end

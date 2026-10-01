@@ -19,7 +19,6 @@ class TestConfig < Minitest::Test
   end
 
   def test_both_relays_accept_the_same_config
-    skip "TODO: Tcp takes rtt/mss instead of Config"
     udp = Impair::Udp.new(target_host: "127.0.0.1", target_port: 1, **LINK)
     tcp = Impair::Tcp.new(target_host: "127.0.0.1", target_port: 1, **LINK)
 
@@ -33,12 +32,10 @@ class TestConfig < Minitest::Test
   # the stall is derived, not configured separately -- two knobs for one
   # quantity is how the arms drift apart.
   def test_rtt_is_derived_from_delay
-    skip "TODO: Config#rtt"
     assert_in_delta 0.05, Impair::Config.new(delay: 0.025).rtt, 1e-9
   end
 
   def test_tcp_accepts_every_udp_key
-    skip "TODO: shared Config"
     config = Impair::Config.new(reorder: 10, corrupt: 10, max_size: 1200, jitter: 0.005)
     tcp = Impair::Tcp.new(target_host: "127.0.0.1", target_port: 1, **config.to_h)
     assert tcp
@@ -47,7 +44,6 @@ class TestConfig < Minitest::Test
   end
 
   def test_rejects_nonsense
-    skip "TODO: Config#validate!"
     assert_raises(ArgumentError) { Impair::Config.new(loss: -1) }
     assert_raises(ArgumentError) { Impair::Config.new(delay: -0.1) }
     assert_raises(ArgumentError) { Impair::Config.new(loss: 1.5) }
@@ -58,7 +54,6 @@ class TestConfig < Minitest::Test
   # 1/loss, or "loss: 50" would mean something different the moment you turn
   # burst on and the two arms stop being comparable.
   def test_burst_preserves_the_overall_loss_rate
-    skip "TODO: Gilbert-Elliott"
     config = Impair::Config.new(loss: 50, burst: 5)
     assert_in_delta 0.02, config.loss_rate, 1e-9
   end

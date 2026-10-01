@@ -53,7 +53,6 @@ class TestUdp < Minitest::Test
   # burst stalls every stream on a TCP connection, and only the affected
   # streams on QUIC. The overall rate must not change when burst is on.
   def test_burst_loss_clusters_drops_without_changing_the_rate
-    skip "TODO: Gilbert-Elliott"
     relay = build_relay(loss: 20, burst: 8, seed: 3)
     exchange(relay, 2000)
 
@@ -66,7 +65,6 @@ class TestUdp < Minitest::Test
   # --- delay ----------------------------------------------------------------
 
   def test_jitter_spreads_arrival_times
-    skip "TODO: Config#jitter"
     relay = build_relay(delay: 0.02, jitter: 0.015)
     client = UDPSocket.new
     arrivals = []
@@ -139,7 +137,6 @@ class TestUdp < Minitest::Test
   # A shaper queues; a policer discards. Over a shaped link a burst arrives
   # late and complete. Over a policed one it arrives on time and short.
   def test_bandwidth_queues_instead_of_discarding
-    skip "TODO: Config#bandwidth (bytes/sec, shaper)"
     relay = build_relay(bandwidth: 100_000) # 100 KB/s
     elapsed = timed do
       back = exchange(relay, 50, size: 1000, wait: 2) # 50 KB ≈ 0.5s

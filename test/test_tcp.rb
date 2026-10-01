@@ -22,7 +22,7 @@ class TestTcp < Minitest::Test
   # once -- the TCP analogue of a burst of datagrams. Returns one entry per
   # successful round trip, so the shared tests can count them.
   def exchange(relay, count, wait: 2)
-    Array.new(count) { |i| Thread.new { tcp_roundtrip(relay, "hello-#{i}", timeout: wait) } }
+    Array.new(count) { |i| Thread.new { Thread.current.report_on_exception = false; tcp_roundtrip(relay, "hello-#{i}", timeout: wait) } }
       .map { |t| t.value rescue nil }.compact
   end
 
@@ -39,7 +39,7 @@ class TestTcp < Minitest::Test
 
   # TCP cannot drop bytes here, so loss must never show up as corruption.
   def test_loss_never_damages_the_stream
-    relay = build_relay(loss: 3, rtt: 0.01)
+    relay = build_relay(loss: 3, delay: 0.005)
     payload = Random.new(2).bytes(50_000)
 
     assert_equal payload, tcp_roundtrip(relay, payload)
@@ -77,7 +77,7 @@ class TestTcp < Minitest::Test
   # Loss on the TCP arm is a head-of-line stall for one RTT per lost segment.
   # 100 KB is ~70 segments; at 1-in-10 that is ~7 stalls of 50ms each way.
   def test_loss_costs_one_rtt_per_lost_segment
-    relay = build_relay(loss: 10, rtt: 0.05, seed: 5)
+    relay = build_relay(loss: 10, delay: 0.025, seed: 5)
     payload = Random.new(3).bytes(100_000)
 
     elapsed = timed { tcp_roundtrip(relay, payload) }
@@ -95,7 +95,6 @@ class TestTcp < Minitest::Test
   # per segment rather than once per link. 100 KB at 25ms one-way should take
   # ~50ms plus transfer, not 70 segments x 25ms = 1.75s.
   def test_delay_is_not_paid_per_segment
-    skip "BUG: Tcp#pump sleeps inline per chunk"
     relay = build_relay(delay: 0.025)
     elapsed = timed { tcp_roundtrip(relay, Random.new(4).bytes(100_000)) }
 
@@ -105,7 +104,7 @@ class TestTcp < Minitest::Test
   end
 
   def test_loss_is_decided_per_segment_not_per_read
-    relay = build_relay(loss: 2, rtt: 0.001, mss: 1000)
+    relay = build_relay(loss: 2, delay: 0.0005, mss: 1000)
     tcp_roundtrip(relay, "x" * 20_000) # 20 segments in, 20 out
 
     assert_in_delta 40, relay.counts.forwarded, 4
@@ -116,12 +115,13 @@ class TestTcp < Minitest::Test
   # Both arms must express the same link the same way. Tcp currently takes
   # rtt separately, so a caller must remember rtt == 2 * delay themselves.
   def test_stall_per_loss_is_two_times_delay
-    skip "TODO: derive stall from Config#delay; drop rtt kwarg"
     relay = build_relay(loss: 1, delay: 0.025, mss: 1000) # every segment stalls
     elapsed = timed { tcp_roundtrip(relay, "x" * 10_000) }
 
-    # 10 segments each way, each stalled 50ms, plus 25ms transit each way.
-    assert_operator elapsed, :>, 1.0
+    # 10 segments each way, each stalled one 50ms RTT. The two directions
+    # pipeline, so the floor is one direction's worth of stalls.
+    assert_operator elapsed, :>, 0.5
+    assert_equal 20, relay.counts.dropped
   ensure
     relay&.stop
   end
@@ -145,7 +145,6 @@ class TestTcp < Minitest::Test
   # --- faults -----------------------------------------------------------------
 
   def test_reset_kills_live_connections
-    skip "TODO: Tcp#reset"
     relay = build_relay
     client = TCPSocket.new("127.0.0.1", relay.port)
     client.write("hello")
@@ -164,7 +163,6 @@ class TestTcp < Minitest::Test
   end
 
   def test_new_connections_work_after_reset
-    skip "TODO: Tcp#reset"
     relay = build_relay
     tcp_roundtrip(relay, "before")
     relay.reset
@@ -175,7 +173,6 @@ class TestTcp < Minitest::Test
   end
 
   def test_connections_are_counted
-    skip "TODO: Counts#connections"
     relay = build_relay
     exchange(relay, 3)
 
