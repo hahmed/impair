@@ -33,10 +33,11 @@ module Impair
   class Tcp
     include Relay
 
-    def initialize(target_host:, target_port:, host: "127.0.0.1", port: 0, **options)
+    def initialize(target_host:, target_port:, host: "127.0.0.1", port: 0,
+      trace: false, replay: nil, **options)
       @target_host = target_host
       @target_port = target_port
-      @link = Link.new(Config.new(**options))
+      @link = Link.new(Config.new(**options), trace: trace, replay: replay)
       @server = TCPServer.new(host, port)
       @port = @server.addr[1]
       @connections = []
@@ -138,9 +139,13 @@ module Impair
           deadline = [deadline, @link.blackhole_until].max
         end
 
+        # A lost segment is counted as dropped, not forwarded, same as a lost
+        # datagram: the link lost that packet. That TCP then retransmits it
+        # is the stall, which is what the deadline carries.
+        action = :forwarded
         if @link.lost?(direction)
           # The gap stalls everything behind it, which is the whole point.
-          @link.bump(direction, :dropped)
+          action = :dropped
           deadline += config.rtt
         end
 
@@ -152,7 +157,8 @@ module Impair
           deadline += config.rtt
         end
 
-        @link.bump(direction, :forwarded)
+        @link.bump(direction, action)
+        @link.record(direction, action, chunk.bytesize, deadline - @link.now)
         last_deadline = deadline
         outbox << [deadline, chunk]
       end

@@ -8,11 +8,17 @@ module Impair
   class Link
     Direction = %i[client server].freeze
 
-    attr_reader :config, :counts
+    attr_reader :config, :counts, :trace
 
-    def initialize(config)
+    # trace: true records every decision. replay: a Trace (or anything with
+    # #losses) whose loss decisions are used instead of the RNG, per
+    # direction, until exhausted; then the configured loss takes over.
+    def initialize(config, trace: false, replay: nil)
       @config = config
       @counts = Counts.new
+      @trace = Trace.new if trace
+      @replay = replay&.losses
+      @replay_pos = { client: 0, server: 0 }
       @mutex = Mutex.new
       # One RNG per direction. A single shared RNG drawn from both pumps makes
       # the sequence each direction sees depend on scheduler interleaving:
@@ -56,26 +62,26 @@ module Impair
       @mutex.synchronize { @counts[direction][field] += 1 }
     end
 
+    # No-op unless tracing. Callers record forwarded themselves, with the
+    # wait, once they know the packet is actually leaving.
+    def record(direction, action, bytes, wait = 0.0)
+      @trace&.record(direction, action, bytes, wait)
+    end
+
     # Decide whether the link carries this packet. Returns the data to send
     # (possibly corrupted) or nil if it was discarded, in which case it has
     # already been tallied. The caller tallies forwarded once it actually
     # sends. Order matters: a packet the link never carried cannot also be
     # corrupted.
     def admit(direction, data, corruptible: true)
-      if blackholed?
-        bump(direction, :blackholed)
-        return nil
+      reason = if blackholed? then :blackholed
+      elsif lost?(direction) then :dropped
+      elsif too_large?(direction, data) then :oversized
+      elsif throttled?(direction) then :throttled
       end
-      if lost?(direction)
-        bump(direction, :dropped)
-        return nil
-      end
-      if too_large?(direction, data)
-        bump(direction, :oversized)
-        return nil
-      end
-      if throttled?(direction)
-        bump(direction, :throttled)
+      if reason
+        bump(direction, reason)
+        record(direction, reason, data.bytesize)
         return nil
       end
 
@@ -98,6 +104,7 @@ module Impair
         queued_bytes = (start - t) * @config.bandwidth
         if queued_bytes + bytes > @config.queue
           @counts[direction].overflow += 1
+          @trace&.record(direction, :overflow, bytes)
           return nil
         end
         @free_at[direction] = start + bytes.fdiv(@config.bandwidth)
@@ -149,6 +156,21 @@ module Impair
     # separate -- one burst stalls every stream on a TCP connection and only
     # the hit streams on QUIC -- so independent loss understates the gap.
     def lost?(direction)
+      lost = decide_loss(direction)
+      @trace&.decide(direction, lost)
+      lost
+    end
+
+    private
+
+    def decide_loss(direction)
+      if @replay && (list = @replay[direction]) && @replay_pos[direction] < list.size
+        bump(direction, :replayed)
+        pos = @replay_pos[direction]
+        @replay_pos[direction] += 1
+        return list[pos]
+      end
+
       return false unless @config.loss.positive?
       return roll?(direction, @config.loss) if @config.burst <= 1
 
@@ -175,8 +197,6 @@ module Impair
         end
       end
     end
-
-    private
 
     def roll?(direction, denominator) = denominator.positive? && rng(direction).rand(denominator).zero?
 
@@ -306,10 +326,29 @@ module Impair
   # What Udp and Tcp share above the Link: lifecycle, counts, runtime control,
   # and self-verification.
   module Relay
+    def self.included(base) = base.extend(ClassMethods)
+
+    module ClassMethods
+      # Build and start in one step. With a block, yields the running relay
+      # and stops it afterwards, raise or not, returning the counts.
+      def start(...)
+        relay = new(...).start
+        return relay unless block_given?
+
+        begin
+          yield relay
+        ensure
+          relay.stop
+        end
+        relay.counts
+      end
+    end
+
     attr_reader :port
 
     def config = @link.config
     def counts = @link.counts
+    def trace = @link.trace
 
     def update(**changes)
       @link.update(**changes)

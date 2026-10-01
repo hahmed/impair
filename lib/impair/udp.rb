@@ -19,10 +19,10 @@ module Impair
     # exposed, because a silently clamped buffer is the failure this guards
     # against. See Relay#shortfall.
     def initialize(target_host:, target_port:, host: "127.0.0.1", port: 0,
-      rcvbuf: 8 * 1024 * 1024, **options)
+      rcvbuf: 8 * 1024 * 1024, trace: false, replay: nil, **options)
       @target_host = target_host
       @target_port = target_port
-      @link = Link.new(Config.new(**options))
+      @link = Link.new(Config.new(**options), trace: trace, replay: replay)
       # UDPSocket.new defaults to IPv4, so an IPv6 bind needs the family
       # stated. localhost resolves to ::1 first on macOS, which is where the
       # server under test binds.
@@ -129,6 +129,7 @@ module Impair
         wait += config.reorder_delay
       end
 
+      @link.record(direction, :forwarded, data.bytesize, wait)
       if wait.positive?
         @link.after(wait) { send.call(data) }
       else

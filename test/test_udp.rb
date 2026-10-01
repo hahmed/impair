@@ -6,6 +6,8 @@ class TestUdp < Minitest::Test
   include RelayHelpers
   include SharedRelayTests
 
+  RELAY = Impair::Udp
+
   def setup
     @echo = Echo::Udp.new
   end
@@ -19,6 +21,17 @@ class TestUdp < Minitest::Test
   end
 
   def exchange(relay, count, **options) = udp_exchange(relay, count, **options)
+
+  # A closed UDP port has nothing to refuse; prove it by getting nothing back.
+  def probe_closed(port)
+    c = UDPSocket.new
+    c.send("x", 0, "127.0.0.1", port)
+    raise Timeout::Error unless IO.select([c], nil, nil, 0.2)
+
+    c.recvfrom(64)
+  ensure
+    c&.close
+  end
 
   # --- loss -----------------------------------------------------------------
 

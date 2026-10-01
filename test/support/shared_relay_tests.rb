@@ -16,6 +16,37 @@ module SharedRelayTests
     relay&.stop
   end
 
+  def test_class_start_builds_and_starts
+    relay = self.class::RELAY.start(target_host: "127.0.0.1", target_port: @echo.port, host: "127.0.0.1")
+    assert_operator relay.port, :>, 0
+    assert_equal 5, exchange(relay, 5).size
+  ensure
+    relay&.stop
+  end
+
+  def test_block_form_stops_and_returns_counts
+    port = nil
+    counts = self.class::RELAY.start(target_host: "127.0.0.1", target_port: @echo.port, host: "127.0.0.1") do |relay|
+      port = relay.port
+      exchange(relay, 5)
+    end
+
+    assert_kind_of Impair::Counts, counts
+    assert_equal 10, counts.forwarded
+    assert_raises(Errno::ECONNREFUSED, Errno::ECONNRESET, Timeout::Error, IOError) { probe_closed(port) }
+  end
+
+  def test_block_form_stops_on_raise
+    relay_ref = nil
+    assert_raises(RuntimeError) do
+      self.class::RELAY.start(target_host: "127.0.0.1", target_port: @echo.port, host: "127.0.0.1") do |relay|
+        relay_ref = relay
+        raise "benchmark blew up"
+      end
+    end
+    assert_same relay_ref.counts, relay_ref.stop # already stopped: idempotent return
+  end
+
   def test_a_clean_relay_loses_nothing
     relay = build_relay
     sent = 50
@@ -115,6 +146,62 @@ module SharedRelayTests
     result = relay.shortfall(client: 10, server: 10)
     assert_equal 0, result[:missing]
     assert_equal 0, relay.shortfall(client: 10)[:missing]
+  end
+
+  # --- trace / replay ---------------------------------------------------
+
+  def test_trace_records_one_event_per_packet
+    relay = build_relay(loss: 3, trace: true)
+    exchange(relay, 30)
+    relay.stop
+
+    assert_equal relay.counts.total, relay.trace.size
+    assert_equal relay.counts.dropped, relay.trace.count { |e| e.action == :dropped }
+    event = relay.trace.first
+    assert_includes %i[client server], event.direction
+    assert_kind_of Float, event.t
+    assert_operator event.bytes, :>, 0
+  ensure
+    relay&.stop
+  end
+
+  def test_trace_is_off_by_default
+    relay = build_relay
+    exchange(relay, 5)
+    assert_nil relay.trace
+  ensure
+    relay&.stop
+  end
+
+  # The fairness guarantee. Two runs with the same seed drift once return
+  # traffic interleaves differently; two runs on the same replay cannot.
+  def test_replay_reproduces_the_exact_loss_pattern
+    first = build_relay(loss: 3, trace: true)
+    exchange(first, 40)
+    first.stop
+
+    second = build_relay(loss: 0, replay: first.trace)
+    exchange(second, 40)
+    second.stop
+
+    assert_operator first.counts.dropped, :>, 0
+    assert_equal first.counts.client.dropped, second.counts.client.dropped
+    assert_equal first.trace.losses[:client].size, second.counts.client.replayed
+    assert_equal first.trace.losses[:server].size, second.counts.server.replayed
+  end
+
+  def test_replay_falls_back_to_config_when_exhausted
+    script = Impair::Trace.new
+    script.losses = { client: [true, false], server: [] }
+
+    relay = build_relay(loss: 0, replay: script)
+    exchange(relay, 10)
+
+    assert_equal 1, relay.counts.client.dropped
+    assert_equal 2, relay.counts.client.replayed
+    assert_equal 0, relay.counts.server.replayed
+  ensure
+    relay&.stop
   end
 
   def test_verify_passes_on_a_quiet_link

@@ -7,8 +7,8 @@ link with a round trip and some loss, without root or a VM.
 ```ruby
 link = { delay: 0.025, loss: 50, burst: 5, seed: 1234 }
 
-udp = Impair::Udp.new(target_host: "::1", target_port: 4433, **link).start
-tcp = Impair::Tcp.new(target_host: "::1", target_port: 8443, **link).start
+udp = Impair::Udp.start(target_host: "::1", target_port: 4433, **link)
+tcp = Impair::Tcp.start(target_host: "::1", target_port: 8443, **link)
 
 # point the clients at udp.port / tcp.port instead of 4433 / 8443
 
@@ -17,6 +17,11 @@ udp.blackhole(0.5)         # cut it entirely for 500ms
 tcp.reset                  # RST every live TCP connection
 
 udp.stop # => counts
+
+# or let the block stop it, raise or not:
+counts = Impair::Udp.start(target_host: "::1", target_port: 4433, **link) do |relay|
+  run_benchmark(port: relay.port)
+end
 ```
 
 One `Config`, both relays, same units — so "the same link" is actually the
@@ -69,6 +74,26 @@ before the relay sees them. Those thin `forwarded` and `dropped` together, so
 far more — a relay losing 26% of packets reports a healthy 2.1%. `verify!`
 raises if the relay didn't see what you sent, and says whether the kernel
 dropped it or the relay's own queue did.
+
+## Trace and replay
+
+```ruby
+h3 = Impair::Udp.start(target_host: ..., target_port: ..., loss: 50, burst: 5, trace: true)
+# ... run the HTTP/3 benchmark ...
+h3.stop
+
+h1 = Impair::Tcp.start(target_host: ..., target_port: ..., replay: h3.trace)
+# ... run the HTTP/1 benchmark on the identical loss pattern ...
+
+File.write("h3.csv", h3.trace.to_csv)   # t, direction, seq, action, bytes, wait
+```
+
+A seed makes a run repeatable, but two *different* protocols on the same seed
+still see different draws: they send different numbers of packets at
+different times. `replay:` takes the RNG out of the loss decision. Both arms
+lose packet #37 because the trace says so, and whatever difference remains is
+the protocol. When the replay runs out, the configured `loss` takes over;
+`counts.replayed` says how many decisions came from the trace.
 
 ## What the TCP arm can and cannot do
 

@@ -6,6 +6,8 @@ class TestTcp < Minitest::Test
   include RelayHelpers
   include SharedRelayTests
 
+  RELAY = Impair::Tcp
+
   def setup
     @echo = Echo::Tcp.new
   end
@@ -17,6 +19,8 @@ class TestTcp < Minitest::Test
   def build_relay(**config)
     Impair::Tcp.new(target_host: "127.0.0.1", target_port: @echo.port, host: "127.0.0.1", **config).start
   end
+
+  def probe_closed(port) = TCPSocket.new("127.0.0.1", port).close
 
   # One "thing" is one connection carrying a small payload, all opened at
   # once -- the TCP analogue of a burst of datagrams. Returns one entry per
@@ -107,7 +111,8 @@ class TestTcp < Minitest::Test
     relay = build_relay(loss: 2, delay: 0.0005, mss: 1000)
     tcp_roundtrip(relay, "x" * 20_000) # 20 segments in, 20 out
 
-    assert_in_delta 40, relay.counts.forwarded, 4
+    assert_in_delta 40, relay.counts.total, 4
+    assert_in_delta 0.5, relay.counts.loss_rate, 0.2
   ensure
     relay&.stop
   end

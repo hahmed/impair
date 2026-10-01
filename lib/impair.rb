@@ -96,7 +96,7 @@ module Impair
   # +overrun+ is the relay dropping on its own floor rather than the link's:
   # the processing queue was full. Distinct from everything above.
   Tally = Struct.new(:forwarded, :dropped, :reordered, :corrupted, :oversized, :throttled,
-    :overflow, :blackholed, :overrun, :longest_burst, keyword_init: true) do
+    :overflow, :blackholed, :overrun, :replayed, :longest_burst, keyword_init: true) do
     def initialize(**kw)
       super(**members.to_h { |m| [m, 0] }.merge(kw))
     end
@@ -150,6 +150,7 @@ module Impair
   end
 end
 
+require_relative "impair/trace"
 require_relative "impair/link"
 require_relative "impair/tcp"
 require_relative "impair/udp"
