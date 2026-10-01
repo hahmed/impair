@@ -55,8 +55,12 @@ module Impair
       @running = true
       @acceptor = Thread.new do
         while @running
-          client = @server.accept
-          Thread.new { serve(client) }
+          # Pass the socket as an argument. A while-loop local is one variable
+          # shared by every iteration, so a block that closes over it can see
+          # the *next* accepted socket if accept returns before the thread
+          # starts -- two threads then serve one connection and another is
+          # never read at all.
+          Thread.new(@server.accept) { |client| serve(client) }
         end
       rescue IOError, Errno::EBADF
         nil
