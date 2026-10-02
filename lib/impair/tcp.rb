@@ -26,9 +26,18 @@ module Impair
   # the difference left over is the protocol's. It follows that loss on a
   # zero-delay link costs nothing here, which is also true of the real thing.
   #
-  # What it does not reproduce: congestion window collapse, spurious
-  # retransmits, SACK behaviour, or the sender learning anything. It emulates
-  # the head-of-line stall, not TCP's full reaction to loss. corrupt, reorder,
+  # It also reproduces the part of the sender's reaction that matters for a
+  # burst. One lost segment is recovered by fast retransmit, one RTT. Three or
+  # more in a row leave no duplicate acks to trigger it, so the sender waits
+  # for the retransmission timer (RFC 6298, floored at rto_min), then
+  # collapses its window to one segment and slow-starts back, so the segments
+  # after the burst are paced by the window rather than the link. Lose the
+  # probe too and the timer doubles. Without this the TCP arm shrugs off the
+  # bursts that trigger persistent congestion on the QUIC side, and the
+  # comparison is rigged.
+  #
+  # What it does not reproduce: SACK, spurious retransmits, cwnd reduction on
+  # isolated loss, or the sender's bandwidth estimate. corrupt, reorder,
   # max_size and rate are accepted for Config parity and ignored.
   class Tcp
     include Relay
@@ -128,6 +137,7 @@ module Impair
       outbox = Queue.new
       writer = Thread.new { write_deferred(outbox, to) }
       last_deadline = 0.0
+      cc = Congestion.new(config)
 
       while (chunk = from.readpartial(config.mss))
         deadline = [@link.now + @link.latency(direction), last_deadline].max
@@ -146,7 +156,11 @@ module Impair
         if @link.lost?(direction)
           # The gap stalls everything behind it, which is the whole point.
           action = :dropped
-          deadline += config.rtt
+          stall, rto = cc.lost
+          @link.bump(direction, :rto) if rto
+          deadline += stall
+        else
+          deadline += cc.delivered
         end
 
         queued = @link.shape(direction, chunk.bytesize)
@@ -167,6 +181,57 @@ module Impair
     ensure
       outbox.close
       writer.join
+    end
+
+    # The sender's window, per direction per connection. Tracks a run of
+    # losses and, once it is long enough to defeat fast retransmit, charges the
+    # RTO and collapses cwnd. Afterwards each delivered segment is paced by the
+    # window: a window of w segments drains in one RTT, so each costs rtt / w,
+    # and the window grows by one per RTT until it is back to where it was.
+    class Congestion
+      FAST_RETRANSMIT_THRESHOLD = 3 # dupacks needed; a run this long has none
+
+      def initialize(config)
+        @config = config
+        @on = config.congestion
+        @run = 0
+        @cwnd = @initial = 10.0
+      end
+
+      # Returns [stall_seconds, rto_fired?].
+      #
+      # A run of losses is one timer event, not one per segment. Every
+      # segment in the run was in flight when the timer expired, and all of
+      # them go out again with the retransmit, so the loss that defeats fast
+      # retransmit pays the RTO and the rest of the run pays nothing more. A
+      # link model that says "lost" ten times in a row is describing one
+      # window, not ten probes.
+      #
+      # Not modelled: exponential backoff when the probe itself is lost. The
+      # loss pattern cannot say which segment is the probe, so charging it
+      # would mean charging it for every segment in the window, which is how
+      # a 10-segment burst came to cost 25 seconds. One RTO per burst is the
+      # floor of what TCP pays, and still an order of magnitude more than the
+      # one-RTT stall it was charged before.
+      def lost
+        @run += 1
+        return [@config.rtt, false] unless @on
+        return [@config.rtt, false] if @run < FAST_RETRANSMIT_THRESHOLD
+        return [0.0, false] if @run > FAST_RETRANSMIT_THRESHOLD
+
+        @cwnd = 1.0
+        [[@config.rto_min, @config.rtt * 2].max, true]
+      end
+
+      # Returns the pacing cost of delivering one segment under the window.
+      def delivered
+        @run = 0
+        return 0.0 unless @on && @cwnd < @initial
+
+        cost = @config.rtt / @cwnd
+        @cwnd = [@cwnd + 1.0 / @cwnd, @initial].min # slow start, one per RTT
+        cost
+      end
     end
 
     def write_deferred(outbox, to)

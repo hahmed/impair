@@ -101,10 +101,16 @@ module RelayHelpers
   end
 
   # Write +payload+ through a TCP relay and read it all back.
-  def tcp_roundtrip(relay, payload, timeout: 5)
+  # mss: write in chunks of that size with a pause, so the relay reads one
+  # segment at a time and a replay script lines up with segments.
+  def tcp_roundtrip(relay, payload, timeout: 5, mss: nil)
     client = TCPSocket.new("127.0.0.1", relay.port)
     client.setsockopt(:IPPROTO_TCP, :TCP_NODELAY, 1)
-    client.write(payload)
+    if mss
+      payload.bytes.each_slice(mss) { |s| client.write(s.pack("C*")); sleep 0.002 }
+    else
+      client.write(payload)
+    end
     Timeout.timeout(timeout) { client.read(payload.bytesize) }
   ensure
     client&.close

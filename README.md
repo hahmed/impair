@@ -40,6 +40,7 @@ same link. `delay` is one-way seconds. `loss`, `reorder` and `corrupt` are
 | `rate: 100, rate_interval: 0.1` | **policer**: >100 packets per 100ms are discarded |
 | `bandwidth: 1_000_000, queue: 64_000` | **shaper**: 1 MB/s, up to 64 KB queued, then discarded |
 | `mss: 1460` | what counts as one segment for TCP's loss decision |
+| `congestion: true, rto_min: 0.2` | TCP reacts to a burst with an RTO and window collapse (see below) |
 | `seed: 1234` | one RNG per direction; same seed, same run |
 
 Use the shaper to see queueing delay and congestion control; use the policer
@@ -98,11 +99,24 @@ the protocol. When the replay runs out, the configured `loss` takes over;
 ## What the TCP arm can and cannot do
 
 `Impair::Tcp` cannot drop bytes, because TCP's reliability lives below a
-userspace relay. It stalls the stream for one RTT per lost segment instead,
-which reproduces the head-of-line stall a receiver sees (RFC 9114 §1.1) but
-not congestion window collapse, SACK, or retransmit behaviour. Conservative
-in TCP's favour. Loss on a zero-delay link therefore costs nothing, which is
-also true of the real thing.
+userspace relay. It charges what a drop costs instead:
+
+- **An isolated loss** stalls the whole connection for one RTT — fast
+  retransmit. That is the head-of-line stall of RFC 9114 §1.1.
+- **Three or more in a row** leave no duplicate acks to trigger it, so the
+  connection waits out the retransmission timer (`rto_min`, Linux's 200ms
+  floor), collapses its window to one segment, and slow-starts back. The
+  segments after a burst are paced by the window, not the link.
+
+The second is what makes bursts comparable. QUIC stacks treat a long burst
+as persistent congestion and collapse too; without this the TCP arm shrugged
+off the exact bursts that cost HTTP/3 a 2-second tail. `congestion: false`
+turns it off for a pure HOL measurement.
+
+Not reproduced: SACK, cwnd reduction on isolated loss, or exponential
+backoff when the probe after an RTO is itself lost (a loss pattern cannot say
+which segment is the probe). So one RTO per burst, which is the floor of what
+TCP pays. Still conservative in TCP's favour, by a bounded amount.
 
 `corrupt`, `reorder`, `max_size` and `rate` are accepted for `Config` parity
 and ignored on TCP.

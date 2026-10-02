@@ -49,16 +49,23 @@ module Impair
   # over-budget queued up to +queue+ bytes, then discarded. Use the shaper to
   # see queueing delay and congestion control; use the policer to see loss.
   #
-  # mss applies to TCP only, where it sets what counts as one segment for the
-  # loss decision. corrupt, reorder and max_size are accepted by TCP and
-  # ignored, because a byte stream cannot carry them.
+  # mss, congestion and rto_min apply to TCP only. mss sets what counts as one
+  # segment for the loss decision. congestion turns on the sender's reaction
+  # to a burst: three or more consecutive losses leave no duplicate acks to
+  # trigger fast retransmit, so the connection waits out the retransmission
+  # timer (rto_min, Linux's 200ms floor), collapses its window to one segment
+  # and slow-starts back. Off, every loss is a one-RTT stall, which is right
+  # for isolated loss and far too kind for bursts. corrupt, reorder and
+  # max_size are accepted by TCP and ignored, because a byte stream cannot
+  # carry them.
   Config = Struct.new(
     :loss, :burst, :reorder, :reorder_delay, :delay, :jitter, :corrupt, :max_size,
-    :rate, :rate_interval, :bandwidth, :queue, :mss, :seed, keyword_init: true
+    :rate, :rate_interval, :bandwidth, :queue, :mss, :congestion, :rto_min, :seed,
+    keyword_init: true
   ) do
     def initialize(loss: 0, burst: 0, reorder: 0, reorder_delay: 0.03, delay: 0, jitter: 0,
       corrupt: 0, max_size: 0, rate: 0, rate_interval: 0.1, bandwidth: 0, queue: 64_000,
-      mss: 1460, seed: 1234)
+      mss: 1460, congestion: true, rto_min: 0.2, seed: 1234)
       super
       validate!
     end
@@ -77,7 +84,7 @@ module Impair
         v = self[k]
         raise ArgumentError, "#{k} must be a non-negative integer, got #{v.inspect}" unless v.is_a?(Integer) && v >= 0
       end
-      %i[reorder_delay delay jitter rate_interval bandwidth queue].each do |k|
+      %i[reorder_delay delay jitter rate_interval bandwidth queue rto_min].each do |k|
         v = self[k]
         raise ArgumentError, "#{k} must be a non-negative number, got #{v.inspect}" unless v.is_a?(Numeric) && v >= 0
       end
@@ -96,7 +103,7 @@ module Impair
   # +overrun+ is the relay dropping on its own floor rather than the link's:
   # the processing queue was full. Distinct from everything above.
   Tally = Struct.new(:forwarded, :dropped, :reordered, :corrupted, :oversized, :throttled,
-    :overflow, :blackholed, :overrun, :replayed, :longest_burst, keyword_init: true) do
+    :overflow, :blackholed, :overrun, :replayed, :rto, :longest_burst, keyword_init: true) do
     def initialize(**kw)
       super(**members.to_h { |m| [m, 0] }.merge(kw))
     end
@@ -139,7 +146,7 @@ module Impair
     def to_s
       t = combined
       parts = ["forwarded=#{t.forwarded}", format("dropped=%d (%.2f%%)", t.dropped, t.loss_rate * 100)]
-      %i[reordered corrupted oversized throttled overflow blackholed overrun].each do |m|
+      %i[reordered corrupted oversized throttled overflow blackholed overrun rto].each do |m|
         parts << "#{m}=#{t[m]}" if t[m].positive?
       end
       parts << "longest_burst=#{t.longest_burst}" if t.longest_burst > 1

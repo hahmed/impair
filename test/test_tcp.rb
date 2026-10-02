@@ -17,6 +17,7 @@ class TestTcp < Minitest::Test
   end
 
   def build_relay(**config)
+    config[:mss] ||= 1000 if config.key?(:replay)
     Impair::Tcp.new(target_host: "127.0.0.1", target_port: @echo.port, host: "127.0.0.1", **config).start
   end
 
@@ -42,8 +43,10 @@ class TestTcp < Minitest::Test
   end
 
   # TCP cannot drop bytes here, so loss must never show up as corruption.
+  # congestion: false, because 1-in-3 is a dead link and this test is about
+  # bytes, not timers.
   def test_loss_never_damages_the_stream
-    relay = build_relay(loss: 3, delay: 0.005)
+    relay = build_relay(loss: 3, delay: 0.005, congestion: false)
     payload = Random.new(2).bytes(50_000)
 
     assert_equal payload, tcp_roundtrip(relay, payload)
@@ -120,7 +123,10 @@ class TestTcp < Minitest::Test
   # Both arms must express the same link the same way. Tcp currently takes
   # rtt separately, so a caller must remember rtt == 2 * delay themselves.
   def test_stall_per_loss_is_two_times_delay
-    relay = build_relay(loss: 1, delay: 0.025, mss: 1000) # every segment stalls
+    # Every segment lost, so the HOL stall is the whole cost. Congestion off:
+    # with it on this is a link that never delivers and RTOs forever, which is
+    # correct and not what this test is about.
+    relay = build_relay(loss: 1, delay: 0.025, mss: 1000, congestion: false)
     elapsed = timed { tcp_roundtrip(relay, "x" * 10_000) }
 
     # 10 segments each way, each stalled one 50ms RTT. The two directions
@@ -129,6 +135,88 @@ class TestTcp < Minitest::Test
     assert_equal 20, relay.counts.dropped
   ensure
     relay&.stop
+  end
+
+  # --- congestion -------------------------------------------------------------
+  #
+  # One lost segment is a fast retransmit: one RTT, the whole connection.
+  # Three or more in a row and there are no duplicate acks to trigger it, so
+  # the sender waits for the retransmission timer (RFC 6298; Linux floors it
+  # at 200ms) and then collapses cwnd to one segment and slow-starts back.
+  # Without this the TCP arm shrugs off exactly the bursts that hurt QUIC.
+
+  def test_an_isolated_loss_costs_one_rtt
+    relay = build_relay(loss: 0, delay: 0.01, replay: script(client: [false, true, false, false]))
+    elapsed = timed { tcp_roundtrip(relay, "x" * 4000, mss: 1000) }
+
+    # 20ms RTT for the stall + 20ms transit. Nowhere near an RTO.
+    assert_operator elapsed, :<, 0.15
+    assert_equal 0, relay.counts.rto
+  ensure
+    relay&.stop
+  end
+
+  def test_a_burst_triggers_an_rto
+    relay = build_relay(loss: 0, delay: 0.01, replay: script(client: [true, true, true, false]))
+    elapsed = timed { tcp_roundtrip(relay, "x" * 4000, mss: 1000) }
+
+    assert_equal 1, relay.counts.client.rto
+    assert_operator elapsed, :>=, 0.2, "RTO floor not paid: #{elapsed}"
+  ensure
+    relay&.stop
+  end
+
+  def test_cwnd_collapse_slows_the_segments_after_an_rto
+    # Same bytes, same loss positions; the only difference is what comes
+    # after. With collapse the next segments are paced by a 1-MSS window
+    # growing by one per RTT, so 8 segments after the burst take ~3 RTTs more
+    # than they would unimpaired.
+    burst_then_clean = [true, true, true] + [false] * 8
+    with_cc = build_relay(loss: 0, delay: 0.02, replay: script(client: burst_then_clean))
+    a = timed { tcp_roundtrip(with_cc, "x" * 11_000, mss: 1000) }
+    with_cc.stop
+
+    without = build_relay(loss: 0, delay: 0.02, congestion: false, replay: script(client: burst_then_clean))
+    b = timed { tcp_roundtrip(without, "x" * 11_000, mss: 1000) }
+    without.stop
+
+    assert_operator a - b, :>, 0.08, "collapse added only #{((a - b) * 1000).round}ms"
+  end
+
+  # Ten lost in a row is one window, not ten probes: one RTO, not ten.
+  def test_a_long_burst_pays_one_rto_not_one_per_segment
+    relay = build_relay(loss: 0, delay: 0.01, replay: script(client: [true] * 10 + [false]))
+    elapsed = timed { tcp_roundtrip(relay, "x" * 11_000, mss: 1000) }
+
+    assert_equal 1, relay.counts.client.rto
+    assert_operator elapsed, :<, 0.6, "#{elapsed}s for one burst"
+  ensure
+    relay&.stop
+  end
+
+  # Two separate bursts are two timer events.
+  def test_separate_bursts_each_pay
+    pattern = [true] * 3 + [false] * 3 + [true] * 3 + [false]
+    relay = build_relay(loss: 0, delay: 0.01, replay: script(client: pattern))
+    tcp_roundtrip(relay, "x" * (pattern.size * 1000), mss: 1000)
+
+    assert_equal 2, relay.counts.client.rto
+  ensure
+    relay&.stop
+  end
+
+  def test_congestion_can_be_switched_off
+    relay = build_relay(loss: 0, delay: 0.01, congestion: false, replay: script(client: [true] * 5))
+    elapsed = timed { tcp_roundtrip(relay, "x" * 5000, mss: 1000) }
+
+    assert_equal 0, relay.counts.rto
+    assert_operator elapsed, :<, 0.2
+  ensure
+    relay&.stop
+  end
+
+  def script(client: [], server: [])
+    Impair::Trace.new.tap { |t| t.losses = {client: client, server: server} }
   end
 
   # --- Nagle ------------------------------------------------------------------
