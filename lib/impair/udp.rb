@@ -80,6 +80,31 @@ module Impair
       counts
     end
 
+    # Change the source port the server sees for every client, the way a NAT
+    # does when its mapping expires (RFC 4787 4.3) or a phone moves from
+    # Wi-Fi to cellular. Each flow's upstream socket is replaced by a fresh
+    # one, so the server's next packet from this client arrives from a port
+    # it has never seen. QUIC validates the new path and carries on (RFC
+    # 9000 9); a TCP connection would simply be gone, which is why the TCP
+    # relay has no equivalent and offers +reset+ instead.
+    #
+    # Packets already scheduled for delivery go out on the new socket, since
+    # they read the flow's socket at send time: a rebind mid-delay is a
+    # rebind, not a loss.
+    def rebind
+      each_flow do |flow|
+        fresh = UDPSocket.new(family_for(@target_host))
+        apply_rcvbuf(fresh, @requested_rcvbuf)
+        old = flow.upstream
+        flow.upstream = fresh
+        # Closing the old socket ends its receiver, which exits on EBADF.
+        old.close unless old.closed?
+        flow.receiver = Thread.new { receive_from_server(flow) }
+        counts.rebinds += 1
+      end
+      self
+    end
+
     private
 
     def pending?
@@ -106,10 +131,14 @@ module Impair
     end
 
     # Replies for one client. Each flow's upstream socket only ever hears
-    # from the server, so whatever arrives belongs to this client.
+    # from the server, so whatever arrives belongs to this client. Reads the
+    # socket once rather than through the flow each time, so a rebind that
+    # swaps flow.upstream leaves this thread on the old socket, where close
+    # ends it, while the new receiver takes the new one.
     def receive_from_server(flow)
+      socket = flow.upstream
       while @running
-        data, = flow.upstream.recvfrom(65_535)
+        data, = socket.recvfrom(65_535)
         enqueue(:server, flow, data)
       end
     rescue IOError, Errno::EBADF, ClosedQueueError

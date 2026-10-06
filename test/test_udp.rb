@@ -87,6 +87,70 @@ class TestUdp < Minitest::Test
     clients&.each(&:close)
   end
 
+  # --- rebinding ------------------------------------------------------------
+  #
+  # A NAT mapping expires, or a phone changes network, and the server sees
+  # the same client arrive from a new port. QUIC validates the new path and
+  # carries on (RFC 9000 9). The relay has to make the server see it.
+
+  def test_rebind_changes_the_port_the_server_sees
+    relay = build_relay
+    client = UDPSocket.new.tap { |c| c.connect("127.0.0.1", relay.port) }
+
+    client.send("before", 0)
+    assert IO.select([client], nil, nil, 1), "no reply before rebind"
+    assert_equal "before", client.recvfrom(64)[0]
+    before = @echo.peers.dup
+
+    relay.rebind
+
+    client.send("after", 0)
+    assert IO.select([client], nil, nil, 1), "no reply after rebind"
+    assert_equal "after", client.recvfrom(64)[0]
+
+    assert_equal 1, before.size
+    assert_equal 2, @echo.peers.size, "server did not see a new source port"
+    assert_equal 1, relay.counts.rebinds
+  ensure
+    client&.close
+    relay&.stop
+  end
+
+  def test_rebind_covers_every_flow
+    relay = build_relay
+    clients = Array.new(3) { UDPSocket.new.tap { |c| c.connect("127.0.0.1", relay.port) } }
+    clients.each { |c| c.send("x", 0) }
+    clients.each { |c| IO.select([c], nil, nil, 1) && c.recvfrom(64) }
+
+    relay.rebind
+    clients.each { |c| c.send("y", 0) }
+    clients.each { |c| assert IO.select([c], nil, nil, 1), "a flow lost its reply after rebind"; c.recvfrom(64) }
+
+    assert_equal 6, @echo.peers.size
+    assert_equal 3, relay.counts.rebinds
+  ensure
+    clients&.each(&:close)
+    relay&.stop
+  end
+
+  # A packet sitting in the delay queue when the rebind happens goes out on
+  # the new socket. A rebind is a path change, not a loss.
+  def test_packets_in_flight_during_a_rebind_are_delivered
+    relay = build_relay(delay: 0.1)
+    client = UDPSocket.new.tap { |c| c.connect("127.0.0.1", relay.port) }
+
+    client.send("in-flight", 0)
+    sleep 0.02 # admitted and scheduled, not yet sent
+    relay.rebind
+
+    assert IO.select([client], nil, nil, 1), "in-flight packet was lost by the rebind"
+    assert_equal "in-flight", client.recvfrom(64)[0]
+    assert_equal 1, relay.counts.client.forwarded
+  ensure
+    client&.close
+    relay&.stop
+  end
+
   # --- loss -----------------------------------------------------------------
 
   # The assertion the benchmarks depend on: the advertised impairment has to

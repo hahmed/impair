@@ -14,6 +14,7 @@ tcp = Impair::Tcp.start(target_host: "::1", target_port: 8443, **link)
 
 udp.update(loss: 0)        # heal the link mid-run
 udp.blackhole(0.5)         # cut it entirely for 500ms
+udp.rebind                 # every client arrives from a new port, as after a NAT timeout
 tcp.reset                  # RST every live TCP connection
 
 udp.stop # => counts
@@ -122,6 +123,14 @@ matters is six against one, which needs the relay to carry six.
 
 Every flow shares the link. Six connections through a 1-in-50 link each see
 1-in-50, and all six queue in the same shaper.
+
+`rebind` swaps every flow's upstream socket for a fresh one, so the server's
+next packet from each client arrives from a port it has never seen. That is
+what a NAT does when its mapping expires (RFC 4787 §4.3) and what a phone
+does leaving Wi-Fi. QUIC validates the new path and carries on (RFC 9000 §9);
+a TCP connection is simply gone, which is why `Impair::Tcp` has `reset` and
+no `rebind`. Packets already in the delay queue go out on the new socket: a
+rebind is a path change, not a loss. `counts.rebinds` is how many flows moved.
 
 ## What the TCP arm can and cannot do
 

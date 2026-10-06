@@ -28,13 +28,14 @@ module Impair
   # reads as "the link" while relay.counts.client.dropped says which way.
   class Counts
     attr_reader :client, :server
-    attr_accessor :connections, :reset
+    attr_accessor :connections, :reset, :rebinds
 
     def initialize
       @client = Tally.new
       @server = Tally.new
       @connections = 0
       @reset = 0
+      @rebinds = 0
     end
 
     def [](direction) = direction == :client ? @client : @server
@@ -44,7 +45,9 @@ module Impair
     Tally.members.each { |m| define_method(m) { combined[m] } }
     %i[discarded total loss_rate].each { |m| define_method(m) { combined.public_send(m) } }
 
-    def to_h = { client: @client.to_h, server: @server.to_h, connections: @connections, reset: @reset }
+    def to_h
+      { client: @client.to_h, server: @server.to_h, connections: @connections, reset: @reset, rebinds: @rebinds }
+    end
 
     def ==(other) = other.is_a?(Counts) && to_h == other.to_h
 
@@ -57,6 +60,7 @@ module Impair
       parts << "longest_burst=#{t.longest_burst}" if t.longest_burst > 1
       parts << "connections=#{connections}" if connections.positive?
       parts << "reset=#{reset}" if reset.positive?
+      parts << "rebinds=#{rebinds}" if rebinds.positive?
       parts.join(" ")
     end
   end
