@@ -36,9 +36,17 @@ module Impair
   # bursts that trigger persistent congestion on the QUIC side, and the
   # comparison is rigged.
   #
-  # What it does not reproduce: SACK, spurious retransmits, cwnd reduction on
-  # isolated loss, or the sender's bandwidth estimate. corrupt, reorder,
-  # max_size and rate are accepted for Config parity and ignored.
+  # An isolated loss also costs the sender half its window (RFC 5681 3.2:
+  # ssthresh = max(FlightSize / 2, 2 * SMSS), and cwnd is set to it on fast
+  # recovery), and the window then grows by one segment per round trip. Under
+  # scattered loss this is most of what TCP pays: it spends its life in
+  # congestion avoidance, never near its initial window, so every segment is
+  # paced by a window the losses keep cutting. Without it the arm charged only
+  # the stall, and at 1-in-50 that is the smaller cost.
+  #
+  # What it does not reproduce: SACK, spurious retransmits, or the sender's
+  # bandwidth estimate. corrupt, reorder, max_size and rate are accepted for
+  # Config parity and ignored.
   class Tcp
     include Relay
 
@@ -183,19 +191,26 @@ module Impair
       writer.join
     end
 
-    # The sender's window, per direction per connection. Tracks a run of
-    # losses and, once it is long enough to defeat fast retransmit, charges the
-    # RTO and collapses cwnd. Afterwards each delivered segment is paced by the
-    # window: a window of w segments drains in one RTT, so each costs rtt / w,
-    # and the window grows by one per RTT until it is back to where it was.
+    # The sender's window, per direction per connection. An isolated loss
+    # halves it; a run long enough to defeat fast retransmit charges the RTO
+    # and collapses it to one segment. Afterwards each delivered segment is
+    # paced by the window: a window of w segments drains in one RTT, so each
+    # costs rtt / w. Growth is slow start up to ssthresh, one segment per RTT
+    # beyond it (RFC 5681 3.1), and the ceiling is the initial window, because
+    # the relay has no bandwidth estimate to grow past it.
     class Congestion
       FAST_RETRANSMIT_THRESHOLD = 3 # dupacks needed; a run this long has none
+      INITIAL_WINDOW = 10.0 # segments, RFC 6928
+      MIN_WINDOW = 2.0 # RFC 5681 3.2: ssthresh = max(FlightSize / 2, 2 * SMSS)
+
+      attr_reader :cwnd, :ssthresh
 
       def initialize(config)
         @config = config
         @on = config.congestion
         @run = 0
-        @cwnd = @initial = 10.0
+        @cwnd = INITIAL_WINDOW
+        @ssthresh = Float::INFINITY
       end
 
       # Returns [stall_seconds, rto_fired?].
@@ -216,9 +231,19 @@ module Impair
       def lost
         @run += 1
         return [@config.rtt, false] unless @on
+
+        if @run == 1
+          # Fast retransmit: one RTT, and the window halves. Charged on the
+          # first loss of a run only; a run is one congestion event.
+          @ssthresh = [@cwnd / 2, MIN_WINDOW].max
+          @cwnd = @ssthresh
+          return [@config.rtt, false]
+        end
         return [@config.rtt, false] if @run < FAST_RETRANSMIT_THRESHOLD
         return [0.0, false] if @run > FAST_RETRANSMIT_THRESHOLD
 
+        # The timer fired. ssthresh was already set on the first loss of the
+        # run; the window now goes to one segment (RFC 5681 3.1).
         @cwnd = 1.0
         [[@config.rto_min, @config.rtt * 2].max, true]
       end
@@ -226,10 +251,13 @@ module Impair
       # Returns the pacing cost of delivering one segment under the window.
       def delivered
         @run = 0
-        return 0.0 unless @on && @cwnd < @initial
+        return 0.0 unless @on && @cwnd < INITIAL_WINDOW
 
         cost = @config.rtt / @cwnd
-        @cwnd = [@cwnd + 1.0 / @cwnd, @initial].min # slow start, one per RTT
+        # Slow start doubles per RTT (one segment per ack, so +1 per segment);
+        # congestion avoidance adds one per RTT (+1/cwnd per segment).
+        increment = @cwnd < @ssthresh ? 1.0 : 1.0 / @cwnd
+        @cwnd = [@cwnd + increment, INITIAL_WINDOW].min
         cost
       end
     end

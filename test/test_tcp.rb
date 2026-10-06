@@ -156,6 +156,40 @@ class TestTcp < Minitest::Test
     relay&.stop
   end
 
+  # RFC 5681 3.2: an isolated loss halves the window as well as stalling.
+  # The 20 segments after it are then paced by a 5-segment window growing one
+  # per RTT, where before they went out at link speed. Same bytes, same loss
+  # position; only the sender's reaction differs.
+  def test_an_isolated_loss_halves_the_window
+    one_then_clean = [false, true] + [false] * 20
+    with_cc = build_relay(loss: 0, delay: 0.02, replay: script(client: one_then_clean))
+    a = timed { tcp_roundtrip(with_cc, "x" * 22_000, mss: 1000) }
+    with_cc.stop
+
+    without = build_relay(loss: 0, delay: 0.02, congestion: false, replay: script(client: one_then_clean))
+    b = timed { tcp_roundtrip(without, "x" * 22_000, mss: 1000) }
+    without.stop
+
+    assert_operator a - b, :>, 0.05, "halving added only #{((a - b) * 1000).round}ms"
+    assert_equal 0, with_cc.counts.rto, "an isolated loss is not an RTO"
+  end
+
+  # Scattered loss keeps the window cut. Every third segment lost means the
+  # window is halved before it ever grows back, so the connection lives in
+  # congestion avoidance and each segment pays for it.
+  def test_scattered_loss_keeps_the_window_small
+    pattern = Array.new(30) { |i| i % 3 == 1 }
+    with_cc = build_relay(loss: 0, delay: 0.02, replay: script(client: pattern))
+    a = timed { tcp_roundtrip(with_cc, "x" * 30_000, mss: 1000) }
+    with_cc.stop
+
+    without = build_relay(loss: 0, delay: 0.02, congestion: false, replay: script(client: pattern))
+    b = timed { tcp_roundtrip(without, "x" * 30_000, mss: 1000) }
+    without.stop
+
+    assert_operator a - b, :>, 0.1, "congestion avoidance added only #{((a - b) * 1000).round}ms"
+  end
+
   def test_a_burst_triggers_an_rto
     relay = build_relay(loss: 0, delay: 0.01, replay: script(client: [true, true, true, false]))
     elapsed = timed { tcp_roundtrip(relay, "x" * 4000, mss: 1000) }
