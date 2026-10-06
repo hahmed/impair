@@ -223,6 +223,9 @@ class TestTcp < Minitest::Test
     elapsed = timed { tcp_roundtrip(relay, "x" * 11_000, mss: 1000) }
 
     assert_equal 1, relay.counts.client.rto
+    # The burst was replayed, not rolled. It must still be measured, or an arm
+    # replaying a bursty trace reports longest_burst 0 while paying for one.
+    assert_equal 10, relay.counts.client.longest_burst
     assert_operator elapsed, :<, 0.6, "#{elapsed}s for one burst"
   ensure
     relay&.stop

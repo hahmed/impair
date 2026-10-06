@@ -158,6 +158,7 @@ module Impair
     def lost?(direction)
       lost = decide_loss(direction)
       @trace&.decide(direction, lost)
+      track_burst(direction, lost)
       lost
     end
 
@@ -186,14 +187,22 @@ module Impair
         else
           rnd < p_bad_to_good ? :good : :bad
         end
-        if @burst_state[direction] == :bad
+        @burst_state[direction] == :bad
+      end
+    end
+
+    # Measures runs on the decision, whichever path made it. Measuring inside
+    # the Gilbert-Elliott branch left replayed losses uncounted: a TCP arm
+    # replaying a bursty HTTP/3 trace reported longest_burst 0 while losing
+    # the same 1.5% in the same runs.
+    def track_burst(direction, lost)
+      @mutex.synchronize do
+        if lost
           @burst_run[direction] += 1
           t = @counts[direction]
           t.longest_burst = @burst_run[direction] if @burst_run[direction] > t.longest_burst
-          true
         else
           @burst_run[direction] = 0
-          false
         end
       end
     end
