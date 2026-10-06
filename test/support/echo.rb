@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "set"
 require "socket"
 require "timeout"
 
@@ -8,7 +9,7 @@ require "timeout"
 # nothing.
 module Echo
   class Udp
-    attr_reader :port, :received
+    attr_reader :port, :received, :peers
 
     def initialize
       @socket = UDPSocket.new
@@ -16,10 +17,14 @@ module Echo
       @socket.setsockopt(Socket::SOL_SOCKET, Socket::SO_RCVBUF, 8 * 1024 * 1024)
       @port = @socket.addr[1]
       @received = 0
+      # Source addresses seen, so a test can check how many distinct peers
+      # the server thinks it is talking to.
+      @peers = Set.new
       @thread = Thread.new do
         loop do
           data, addr = @socket.recvfrom(65_535)
           @received += 1
+          @peers << [addr[3], addr[1]]
           @socket.send(data, 0, addr[3], addr[1])
         end
       rescue IOError, Errno::EBADF

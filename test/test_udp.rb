@@ -33,6 +33,60 @@ class TestUdp < Minitest::Test
     c&.close
   end
 
+  # --- flows ----------------------------------------------------------------
+  #
+  # A browser opens six TCP connections and one QUIC connection. For the
+  # six-against-one comparison the relay has to carry six clients, and the
+  # server has to see six peers, not one shared source port.
+
+  def test_each_client_gets_its_own_replies
+    relay = build_relay
+    clients = Array.new(3) { UDPSocket.new.tap { |c| c.connect("127.0.0.1", relay.port) } }
+
+    clients.each_with_index { |c, i| 5.times { |n| c.send("client#{i}-#{n}", 0) } }
+    got = clients.map do |c|
+      Array.new(5) do
+        raise Timeout::Error, "reply never came" unless IO.select([c], nil, nil, 1)
+
+        c.recvfrom(64)[0]
+      end.sort
+    end
+
+    clients.each_index do |i|
+      assert_equal Array.new(5) { |n| "client#{i}-#{n}" }.sort, got[i], "client #{i} got someone else's replies"
+    end
+  ensure
+    clients&.each(&:close)
+    relay&.stop
+  end
+
+  def test_the_server_sees_one_peer_per_client
+    relay = build_relay
+    clients = Array.new(6) { UDPSocket.new.tap { |c| c.connect("127.0.0.1", relay.port) } }
+    clients.each { |c| c.send("x", 0) }
+    clients.each { |c| IO.select([c], nil, nil, 1) && c.recvfrom(64) }
+
+    assert_equal 6, @echo.peers.size, "server saw #{@echo.peers.size} peers for 6 clients"
+    assert_equal 6, relay.counts.connections
+  ensure
+    clients&.each(&:close)
+    relay&.stop
+  end
+
+  # All flows share the one link, so the loss is the link's and each flow
+  # sees the advertised rate rather than a share of it.
+  def test_flows_share_the_link
+    relay = build_relay(loss: 10, seed: 7)
+    clients = Array.new(4) { UDPSocket.new.tap { |c| c.connect("127.0.0.1", relay.port) } }
+    clients.each { |c| 250.times { c.send("x" * 100, 0) } }
+    sleep 0.3
+    counts = relay.stop
+
+    assert_in_delta 0.10, counts.client.dropped.fdiv(counts.client.forwarded + counts.client.dropped), 0.03
+  ensure
+    clients&.each(&:close)
+  end
+
   # --- loss -----------------------------------------------------------------
 
   # The assertion the benchmarks depend on: the advertised impairment has to

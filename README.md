@@ -92,9 +92,23 @@ File.write("h3.csv", h3.trace.to_csv)   # t, direction, seq, action, bytes, wait
 A seed makes a run repeatable, but two *different* protocols on the same seed
 still see different draws: they send different numbers of packets at
 different times. `replay:` takes the RNG out of the loss decision. Both arms
-lose packet #37 because the trace says so, and whatever difference remains is
-the protocol. When the replay runs out, the configured `loss` takes over;
+lose packet #37 because the trace says so. What remains is the protocol plus
+whatever the TCP model below gets wrong, so a replayed comparison is only as
+honest as that model, and the model is deliberately conservative. Validate a
+headline number against a packet-level setup (netem, dummynet) before
+publishing it. When the replay runs out, the configured `loss` takes over;
 `counts.replayed` says how many decisions came from the trace.
+
+## Many clients, one link
+
+`Impair::Udp` carries any number of clients. Each source address gets its own
+upstream socket, so the server sees one peer per client rather than one
+shared port; `counts.connections` is how many. A browser opens six TCP
+connections to an origin and one QUIC connection, and the comparison that
+matters is six against one, which needs the relay to carry six.
+
+Every flow shares the link. Six connections through a 1-in-50 link each see
+1-in-50, and all six queue in the same shaper.
 
 ## What the TCP arm can and cannot do
 
@@ -102,7 +116,10 @@ the protocol. When the replay runs out, the configured `loss` takes over;
 userspace relay. It charges what a drop costs instead:
 
 - **An isolated loss** stalls the whole connection for one RTT — fast
-  retransmit. That is the head-of-line stall of RFC 9114 §1.1.
+  retransmit — and halves the sender's window (RFC 5681 §3.2). The segments
+  after it are paced by a window growing one per RTT until it recovers. The
+  stall is the head-of-line cost of RFC 9114 §1.1; the halving is most of
+  what TCP pays under scattered loss.
 - **Three or more in a row** leave no duplicate acks to trigger it, so the
   connection waits out the retransmission timer (`rto_min`, Linux's 200ms
   floor), collapses its window to one segment, and slow-starts back. The
@@ -113,10 +130,10 @@ as persistent congestion and collapse too; without this the TCP arm shrugged
 off the exact bursts that cost HTTP/3 a 2-second tail. `congestion: false`
 turns it off for a pure HOL measurement.
 
-Not reproduced: SACK, cwnd reduction on isolated loss, or exponential
-backoff when the probe after an RTO is itself lost (a loss pattern cannot say
-which segment is the probe). So one RTO per burst, which is the floor of what
-TCP pays. Still conservative in TCP's favour, by a bounded amount.
+Not reproduced: SACK, or exponential backoff when the probe after an RTO is
+itself lost (a loss pattern cannot say which segment is the probe). So one
+RTO per burst, which is the floor of what TCP pays. Still conservative in
+TCP's favour, by a bounded amount.
 
 `corrupt`, `reorder`, `max_size` and `rate` are accepted for `Config` parity
 and ignored on TCP.
