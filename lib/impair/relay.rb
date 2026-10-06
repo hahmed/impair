@@ -40,25 +40,16 @@ module Impair
       self
     end
 
-    # Drive a Scenario against this relay from now until stop. One at a time:
+    # The Scenario currently playing against this relay, or nil.
+    attr_reader :playback
+
+    # Play a Scenario against this relay from now until stop. One at a time:
     # starting another ends the first.
     def run(scenario)
-      stop_scenario
-      @scenario_run = scenario.run(self)
+      @playback&.stop
+      @playback = scenario.run(self)
       self
     end
-
-    def scenario_elapsed = @scenario_run&.elapsed
-
-    private
-
-    # Called from each relay's stop, ahead of tearing down the link.
-    def stop_scenario
-      @scenario_run&.stop
-      @scenario_run = nil
-    end
-
-    public
 
     # What the relay never got to make a decision about.
     #

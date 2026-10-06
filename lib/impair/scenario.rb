@@ -17,7 +17,7 @@ module Impair
   #
   #   relay = Impair::Udp.start(..., scenario: scenario)
   #   # ... or ...
-  #   relay.run(scenario)
+  #   relay.run(scenario)   # => a Playback; relay.stop ends it
   #
   # +at+ fires once. +every+ fires on a tick from t=0 until the relay stops,
   # and is how a waveform is expressed: +wave+, +sawtooth+, +square+ and
@@ -75,68 +75,9 @@ module Impair
       (1 - (phase * 4 - 2).abs) * amplitude
     end
 
-    # --- running --------------------------------------------------------------
-
-    # Drives +relay+ until +stop+ or the relay stops. Returns the Run.
-    def run(relay)
-      Run.new(self, relay).start
-    end
-
-    # One execution of a scenario against one relay: a thread walking the
-    # schedule. Separate from the Scenario so the same schedule can run
-    # against two relays.
-    class Run
-      def initialize(scenario, relay)
-        @scenario = scenario
-        @relay = relay
-        @running = false
-      end
-
-      def start
-        @running = true
-        @started = now
-        @thread = Thread.new { walk }
-        self
-      end
-
-      def stop
-        @running = false
-        @thread&.join(1)
-        self
-      end
-
-      def elapsed = now - @started
-
-      private
-
-      def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-
-      # One-shots in time order, with tickers interleaved by their next due
-      # time. Sleeps until the earliest due action rather than polling.
-      def walk
-        pending = @scenario.actions.map { |a| [a.at, a] }
-        until pending.empty? || !@running
-          pending.sort_by!(&:first)
-          due, action = pending.first
-          wait = due - elapsed
-          sleep(wait) if wait.positive?
-          break unless @running
-
-          fire(action, due)
-          if action.every
-            pending[0] = [due + action.every, action]
-          else
-            pending.shift
-          end
-        end
-      rescue StandardError => e
-        warn "Impair::Scenario: #{e.class}: #{e.message}" if $VERBOSE
-      end
-
-      def fire(action, t)
-        action.block.arity == 1 ? action.block.call(@relay) : action.block.call(@relay, t)
-        @relay.counts.scenario_events += 1
-      end
-    end
+    # Play this schedule against +relay+, from now until the Playback is
+    # stopped. The same Scenario can play against two relays at once; each
+    # call is its own clock and thread.
+    def run(relay) = Playback.new(self, relay)
   end
 end

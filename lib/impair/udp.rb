@@ -65,7 +65,7 @@ module Impair
     def stop(drain: 0.5)
       return counts unless @running
 
-      stop_scenario
+      @playback&.stop
       deadline = @link.now + drain
       sleep 0.01 while pending? && @link.now < deadline
 
