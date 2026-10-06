@@ -99,6 +99,19 @@ headline number against a packet-level setup (netem, dummynet) before
 publishing it. When the replay runs out, the configured `loss` takes over;
 `counts.replayed` says how many decisions came from the trace.
 
+## Scripted loss
+
+```ruby
+Impair::Udp.start(..., loss: 0, replay: Impair::Script.drop(client: 2..7))
+Impair::Script.drop(client: [1, 3, 5], server: 10..12)
+```
+
+Loss by ordinal rather than by chance. "Drop the client's packets 2 to 7" is
+how the QUIC interop runner states a handshake-loss case, and it is the form
+a bug report takes. Ordinals are 1-based and count packets the link admitted
+in that direction. A `Script` is a `replay:`, so past the last named ordinal
+the configured `loss` takes over; `loss: 0` makes the script the whole story.
+
 ## Many clients, one link
 
 `Impair::Udp` carries any number of clients. Each source address gets its own

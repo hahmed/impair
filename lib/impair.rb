@@ -33,6 +33,7 @@ end
 require_relative "impair/config"
 require_relative "impair/counts"
 require_relative "impair/trace"
+require_relative "impair/script"
 require_relative "impair/link"
 require_relative "impair/relay"
 require_relative "impair/tcp"
