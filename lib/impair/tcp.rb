@@ -83,6 +83,7 @@ module Impair
     def stop
       return counts unless @running
 
+      stop_scenario
       @running = false
       @server.close unless @server.closed?
       @acceptor&.join(1)

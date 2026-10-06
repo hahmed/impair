@@ -113,6 +113,30 @@ a bug report takes. Ordinals are 1-based and count packets the link admitted
 in that direction. A `Script` is a `replay:`, so past the last named ordinal
 the configured `loss` takes over; `loss: 0` makes the script the whole story.
 
+## Conditions that change mid-run
+
+```ruby
+scenario = Impair::Scenario.new do
+  at(2.0) { |relay| relay.update(loss: 20) }           # loss rises at t=2s
+  at(5.0) { |relay| relay.blackhole(0.5) }             # dark for 500ms at t=5s
+  at(8.0) { |relay| relay.rebind }                     # NAT rebinds at t=8s
+  every(0.1) { |relay, t| relay.update(delay: 0.02 + wave(t, amplitude: 0.015, period: 6)) }
+end
+
+Impair::Udp.start(..., scenario: scenario) { run_benchmark }
+Impair::Tcp.start(..., scenario: scenario) { run_benchmark }   # same schedule, other arm
+```
+
+A seed makes a run repeatable; a scenario makes a *changing* run repeatable.
+`at` fires once, `every` ticks until the relay stops, and the blocks call
+the same `update` / `blackhole` / `rebind` you would call by hand. Time is
+from when the scenario started, so it can begin after warm-up.
+
+`wave`, `sawtooth`, `square` and `triangle` are zero-mean shapes swinging
+±amplitude over a period (speedbump's four); add one to a base inside an
+`every` to make any Config key oscillate. `counts.scenario_events` says how
+many actions fired, so an experiment can assert the schedule ran.
+
 ## Many clients, one link
 
 `Impair::Udp` carries any number of clients. Each source address gets its own

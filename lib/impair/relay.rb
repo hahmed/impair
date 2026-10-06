@@ -9,8 +9,10 @@ module Impair
     module ClassMethods
       # Build and start in one step. With a block, yields the running relay
       # and stops it afterwards, raise or not, returning the counts.
-      def start(...)
-        relay = new(...).start
+      # +scenario:+ starts a Scenario against the relay as soon as it is up.
+      def start(*args, scenario: nil, **options)
+        relay = new(*args, **options).start
+        relay.run(scenario) if scenario
         return relay unless block_given?
 
         begin
@@ -37,6 +39,26 @@ module Impair
       @link.blackhole(seconds)
       self
     end
+
+    # Drive a Scenario against this relay from now until stop. One at a time:
+    # starting another ends the first.
+    def run(scenario)
+      stop_scenario
+      @scenario_run = scenario.run(self)
+      self
+    end
+
+    def scenario_elapsed = @scenario_run&.elapsed
+
+    private
+
+    # Called from each relay's stop, ahead of tearing down the link.
+    def stop_scenario
+      @scenario_run&.stop
+      @scenario_run = nil
+    end
+
+    public
 
     # What the relay never got to make a decision about.
     #
